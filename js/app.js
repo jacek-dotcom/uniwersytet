@@ -14,8 +14,12 @@ const S = {
   daysOff: null,
   subjects: new Map(), // id → przedmiot
   entries: new Map(), // id wpisu ("2026-11-06-ekonometria") → wpis
+  tasks: [], // zadania dodane ręcznie w widoku Zadania (plik tasks.json), bez powiązania z zajęciami
   error: null,
 };
+
+// Zadania z tasks.json mają w allTasks() entryId = OWN zamiast id wpisu.
+const OWN = "tasks";
 
 const STATUS_LABEL = {
   wolne: "dzień wolny",
@@ -89,6 +93,10 @@ function allTasks(filter = () => true) {
     if (!filter(entry)) continue;
     (entry.tasks || []).forEach((task, index) => out.push({ entryId, index, task, entry }));
   }
+  S.tasks.forEach((task, index) => {
+    const entry = { subject: task.subject || "" };
+    if (filter(entry)) out.push({ entryId: OWN, index, task, entry });
+  });
   return out;
 }
 
@@ -101,20 +109,23 @@ function clearData() {
   S.daysOff = null;
   S.subjects = new Map();
   S.entries = new Map();
+  S.tasks = [];
 }
 
 async function loadAll() {
   clearData();
   store.init();
   if (!store.canRead()) return;
-  const [settings, schedule, daysOff, files] = await Promise.all([
+  const [settings, schedule, daysOff, ownTasks, files] = await Promise.all([
     store.readJSON("settings.json"),
     store.readJSON("schedule.json"),
     store.readJSON("days-off.json"),
+    store.readJSON("tasks.json"),
     store.listEntryFiles(),
   ]);
   if (!schedule) throw new Error("W repozytorium z danymi brakuje pliku schedule.json.");
   S.settings = settings || {};
+  S.tasks = (ownTasks && ownTasks.tasks) || [];
   S.schedule = schedule;
   S.daysOff = daysOff || { days: [] };
   S.subjects = new Map(schedule.subjects.map((s) => [s.id, s]));
@@ -151,10 +162,11 @@ function taskItem({ entryId, index, task, entry }, showSubject = true) {
       <span class="ttext">${linkify(task.text || "(bez opisu)")}</span>
       <span class="meta">
         ${task.kind ? `<span class="kind">${esc(task.kind)}</span>` : ""}
-        ${showSubject ? `<span>${esc(sub.short)}</span>` : ""}
+        ${showSubject && entry.subject ? `<span>${esc(sub.short)}</span>` : ""}
         ${task.due ? `<span class="${late ? "late" : ""}">${cal.fmtDay(task.due, true)} ${cal.fmtDate(task.due)} · ${dueLabel(task.due)}</span>` : ""}
       </span>
     </span>
+    ${entryId === OWN ? `<button class="rm" data-deltask="${index}" aria-label="Usuń zadanie" title="Usuń zadanie">×</button>` : ""}
   </li>`;
 }
 
@@ -262,11 +274,35 @@ function taskGroups(tasks) {
     if (list.length) html += `<h3>${title} <span class="count">${list.length}</span></h3><ul class="tasks">${list.map((x) => taskItem(x)).join("")}</ul>`;
   }
   if (done.length) html += `<details><summary>Zrobione (${done.length})</summary><ul class="tasks">${done.map((x) => taskItem(x)).join("")}</ul></details>`;
-  return html || `<p class="empty">Brak zadań. Dodasz je w formularzu wpisu po zajęciach.</p>`;
+  return html || `<p class="empty">Brak zadań.</p>`;
+}
+
+// Formularz zadania spoza zajęć (np. sprzed aplikacji albo z maila od prowadzącego).
+function addTaskForm() {
+  const subs = S.schedule.subjects.map((s) => `<option value="${esc(s.id)}">${esc(s.short)}</option>`).join("");
+  return `<details class="card addtask" ${S.tasks.length || allTasks().length ? "" : "open"}>
+    <summary><b>+ Dodaj zadanie</b> <span class="muted small">bez wpisu z zajęć</span></summary>
+    <form id="taskForm">
+      <label>Co zrobić<input name="text" required placeholder="np. referat z socjologii, zestaw 2 z ekonometrii"></label>
+      <div class="task-fields">
+        <label>Przedmiot<select name="subject"><option value="">— bez przedmiotu —</option>${subs}</select></label>
+        <label>Termin<input name="due" type="date"></label>
+        <label>Rodzaj<select name="kind">${TASK_KINDS.map((k) => `<option>${k}</option>`).join("")}</select></label>
+      </div>
+      <button class="btn primary" type="submit">Dodaj</button>
+    </form>
+  </details>`;
 }
 
 function viewTasks() {
-  return `<h2>Zadania i terminy</h2>${taskGroups(allTasks())}`;
+  return `<h2>Zadania i terminy</h2>${addTaskForm()}${taskGroups(allTasks())}`;
+}
+
+// Zapis całej listy zadań z tasks.json jednym commitem.
+async function saveOwnTasks(list, message) {
+  if (!store.canSave()) throw new Error("Zapis wymaga tokenu – ustaw go w Ustawieniach.");
+  await store.writeJSON("tasks.json", { _komentarz: "Zadania dodane ręcznie w widoku Zadania (bez wpisu z zajęć).", tasks: list }, message);
+  S.tasks = list;
 }
 
 function viewGerman() {
@@ -450,6 +486,18 @@ document.addEventListener("click", async (ev) => {
       render();
     } catch (e) { toast(e.message, "bad"); }
   }
+  const del = t.closest("[data-deltask]");
+  if (del) {
+    const index = Number(del.dataset.deltask);
+    const task = S.tasks[index];
+    if (!confirm(`Usunąć zadanie „${task.text}”?`)) return;
+    try {
+      await saveOwnTasks(S.tasks.filter((_, i) => i !== index), `zadanie: usunięte – ${task.text.slice(0, 50)}`);
+      toast("Zadanie usunięte.");
+      render();
+    } catch (e) { toast(e.message, "bad"); }
+    return;
+  }
   if (t.id === "forgetToken") {
     store.setToken("");
     clearData();
@@ -468,6 +516,21 @@ document.addEventListener("change", async (ev) => {
   const cb = ev.target.closest("[data-task]");
   if (!cb) return;
   const [entryId, index] = cb.dataset.task.split("|");
+  if (entryId === OWN) {
+    const list = structuredClone(S.tasks);
+    const task = list[Number(index)];
+    task.done = cb.checked;
+    cb.disabled = true;
+    try {
+      await saveOwnTasks(list, `zadanie: ${task.done ? "zrobione" : "do zrobienia"} – ${task.text.slice(0, 50)}`);
+      render();
+    } catch (e) {
+      cb.checked = !cb.checked;
+      cb.disabled = false;
+      toast(e.message, "bad");
+    }
+    return;
+  }
   const entry = structuredClone(S.entries.get(entryId));
   const task = entry.tasks[Number(index)];
   task.done = cb.checked;
@@ -503,6 +566,30 @@ document.addEventListener("submit", async (ev) => {
     } catch (e) {
       btn.disabled = false;
       btn.textContent = "Zapisz";
+      toast(e.message, "bad");
+    }
+  }
+  if (form.id === "taskForm") {
+    const fd = new FormData(form);
+    const task = {
+      text: fd.get("text").trim(),
+      subject: fd.get("subject") || null,
+      due: fd.get("due") || null,
+      kind: fd.get("kind"),
+      done: false,
+      source: "app",
+      createdAt: new Date().toISOString(),
+    };
+    const btn = form.querySelector("[type=submit]");
+    btn.disabled = true;
+    try {
+      await saveOwnTasks([...S.tasks, task], `zadanie: ${task.text.slice(0, 50)}`);
+      toast("Zadanie dodane ✓", "ok");
+      render();
+      $(".addtask").open = true;
+      $("#taskForm [name=text]").focus();
+    } catch (e) {
+      btn.disabled = false;
       toast(e.message, "bad");
     }
   }
